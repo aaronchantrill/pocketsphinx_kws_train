@@ -1,0 +1,10 @@
+[Plugin]
+Name = Pocketsphinx KWS Trainer
+Version = 0.0.1
+License = MIT
+URL = https://github.com/aaronchantrill/naomi_pocketsphinx_kws_trainer
+Description = Optimize keyword spotting using training data
+
+[Author]
+Name = Aaron Chantrill
+URL = https://github.com/aaronchantrill
