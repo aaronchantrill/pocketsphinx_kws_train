@@ -1,10 +1,28 @@
 # -*- coding: utf-8 -*-
+import logging
 import os
 import sqlite3
 from naomi import paths
 from naomi import plugin
 from naomi import profile
-
+from naomi import vocabcompiler
+from . import sphinxvocab 
+try:
+    try:
+        from pocketsphinx import pocketsphinx
+    except ValueError:
+        # Fixes a quirky bug when first import doesn't work.
+        # See http://sourceforge.net/p/cmusphinx/bugs/284/ for details.
+        from pocketsphinx import pocketsphinx
+    pocketsphinx_available = True
+    # Why do we have to import sphinxbase.sphinxbase.*?
+    # otherwise, when we create pocketsphinx.Decoder.default_config()
+    # we get the wrong object for some reason.
+    from sphinxbase.sphinxbase import *
+except ImportError:
+    pocketsphinx = None
+    pocketsphinx_available = False
+from .g2p import PhonetisaurusG2P
 
 # The stt_trainer plugin provides a plugin that is used with the
 # NaomiSTTTrainer.py program to train a stt engine based on the
@@ -46,12 +64,44 @@ class Pocketsphinx_KWS_Train(plugin.STTTrainerPlugin):
     # is because it can take a very long time to actually train a STT
     # engine, and that training can typically be split into distinct
     # stages or loops, with feedback being provided to the user.
-    #
     def __init__(self, *args, **kwargs):
+        super(Pocketsphinx_KWS_Train, self).__init__(*args, **kwargs)
         self.audiolog_dir = paths.sub("audiolog")
         self.audiolog_db = os.path.join(self.audiolog_dir, "audiolog.db")
         self.keywords = [keyword.upper() for keyword in profile.get(['keyword'], ['NAOMI'])]
-        super(Pocketsphinx_KWS_Train, self).__init__(*args, **kwargs)
+        self._logger = logging.getLogger(__name__)
+        self.executable = profile.get(
+            ['pocketsphinx', 'phonetisaurus_executable'],
+            'phonetisaurus-g2p'
+        )
+        self.nbest = profile.get(
+            ['pocketsphinx', 'nbest'],
+            3
+        )
+        self.fst_model = profile.get(['pocketsphinx', 'fst_model'])
+        self.fst_model_alphabet = profile.get(
+            ['pocketsphinx', 'fst_model_alphabet'],
+            'arpabet'
+        )
+        self.g2pconverter = PhonetisaurusG2P(
+            self.executable,
+            self.fst_model,
+            fst_model_alphabet=self.fst_model_alphabet,
+            nbest=self.nbest
+        )
+        self._vocabulary_name='pocketsphinx_kws'
+
+        """
+        Initiates the pocketsphinx instance.
+
+        Arguments:
+            vocabulary -- a PocketsphinxVocabulary instance
+            hmm_dir -- the path of the Hidden Markov Model (HMM)
+        """
+
+        if not pocketsphinx_available:
+            raise ImportError("Pocketsphinx not installed!")
+
 
     # command allows the output to split into stages, and description allows
     # a description to be passed in with the incoming command.
@@ -63,30 +113,128 @@ class Pocketsphinx_KWS_Train(plugin.STTTrainerPlugin):
         try:
             conn = sqlite3.connect(self.audiolog_db)
             c = conn.cursor()
-            if command == "":
+            if(command==""):
+                command="step1"
+            if(command[:4]=="step"):
+                step = eval(command[4:])
+                if(step<50):
+                    nextcommand="step{}".format(step+1)
+                else:
+                    nextcommand="finish"
+                # compile the keywords into a dictionary
+                language = profile.get(['language'], 'en-US')
+
+                vocabulary = vocabcompiler.VocabularyCompiler(
+                    self.info.name,
+                    self._vocabulary_name,
+                    path=paths.sub('vocabularies', language)
+                )
+
+                vocabulary.compile(
+                    vocabulary,
+                    self.keywords
+                )
+
+                # Get a list of all records to tested. This includes records of type
+                # active, passive, noise and unclear (noise and unclear are assumed not
+                # to contain the word "Naomi"
                 query = " ".join([
-                    "select distinct filename",
-                    "from audiolog",
-                    "where transcription like '%{}%'",
-                    "   and type in ('active','passive')"
-                ]).format("%' or transcription like '%".join(self.keywords))
+                    "select distinct",
+                    " filename,",
+                    " transcription,",
+                    " verified_transcription",
+                    "from audiolog"
+                ])
                 c.execute(query)
-                heard=c.fetchall()
-                response.append("""<p>Heard keyword</p>""")
-                for filename in heard:
-                    response.append("""{}""".format(filename[0]))
-                query = " ".join([
-                    "select distinct filename",
-                    "from audiolog",
-                    "where verified_transcription like '%{}%'"
-                ]).format("%' or transcription like '%".join(self.keywords))
-                c.execute(query)
-                said=c.fetchall()
-                response.append("""<p>Said keyword</p>""")
-                for filename in said:
-                    response.append("""{}""".format(filename[0]))
-                nextcommand = ""
-                description.append("Finish")
+                test_data = c.fetchall()
+                # The threshold should be between 1 and 50. Run with 1 first and
+                # get a matrix of true positives, false positives, true negatives
+                # and false negatives. If the audio contains the word "Naomi" then
+                # the word "Naomi" should appear in the verified transcription.
+                # If the type is unclear or noise, then there should not be anything
+                # in the verified transcription
+                threshold=step
+                for keyword in self.keywords:
+                    false_positives = 0
+                    false_negatives = 0
+                    true_positives = 0
+                    total_instances = 0
+                    total_detected = 0
+                    self._logger.debug(keyword)
+                    self._logger.debug(
+                        ("%s --model=%s --beam=1000 --thresh=99.0 --accumulate=true " +
+                        "--pmass=0.85 --nlog_probs=false --wordlist=%s --nbest=%d") %
+                        (self.executable, self.fst_model, tmp_fname, self.nbest)
+                    )
+                    # create a dictionary for the keyword
+                    output = execute(
+                        self.executable,
+                        self.fst_model,
+                        tmp_fname,
+                        is_file=True,
+                        nbest=self.nbest
+                    )
+                    # speech = AudioFile(
+                    #     lm=False,
+                    #     audio_file='/home/pi/.config/naomi/audiolog/2020-06-19_05-36-28k9zu8zyy.wav',
+                    #     keyphrase="NAOMI",
+                    #     kws_threshold=1e-20,
+                    #     hmm='/home/pi/.config/naomi/pocketsphinx/standard/en-US',
+                    #     dict='/home/pi/.config/naomi/vocabularies/en-US/sphinx/keyword/dictionary'
+                    # )
+                    # Pocketsphinx v5
+                    config = pocketsphinx.Decoder.default_config()
+                    config.set_string('-hmm', hmm_dir)
+                    config.set_string('-keyphrase', keyword)
+                    config.set_float('-kws_threshold', eval("1e+{}".format(threshold)))
+                    config.set_string('-dict', dict_path)
+                    config.set_string('-logfn', self._logger)
+                    self._decoder = pocketsphinx.Decoder(config)
+                    # Now we have the decoder configured at the current level
+                    # Run through the data
+                    for recording in test_data:
+                        filename, transcript=recording
+                        transcript=upper(transcript)
+                        # Check how many times the keyphrase actually appears in the transcript
+                        transcript_count = transcript.count(keyword)
+                        decoder_count = 0
+                        with open(filename, "r+b") as fp:
+                            fp.seek(44)
+                            audio_data=fp.read()
+                            decoder.start_utt()
+                            decoder.process_raw(fp)
+                            decoder.end_utt()
+                            for s in decoder.seg():
+                                if(s.word==keyword):
+                                    decoder_count+=1
+                        # so if decoder_count < transcript_count, then we assume
+                        # transcript_count-decoder_count instances got missed
+                        # (false negative)
+                        # if transcript_count < decoder_count, then we assume
+                        # decoder_count - transcript_count instances should
+                        # not have been detected
+                        # (false positive)
+                        # It is, of course, possible that both things have
+                        # happened and that a word is misidentified in the
+                        # wrong place, but we'll assume not.
+                        total_instances += transcript_count
+                        total_detected += decoder_count
+                        if decoder_count < transcript_count:
+                            false_negatives += transcript_count - decoder_count
+                            true_positives += decoder_count
+                        else:
+                            false_positives += decoder_count - transcript_count
+                            true_positives += transcript_count
+                print("Keyword: {}".format(keyword))
+                print("Threshold: {}".format(threshold))
+                print("Correct: {}".format(correct))
+                print("False positives: {}".format(false_positives))
+                print("False negatives: {}".format(false_negatives))
+                print("Precision: {}".format(true_positives/total_detected))
+                print("Recall: {}".format(true_positives/total_instances))
+                print()
+            else:
+                print("Command: {}".format(command))
         except Exception as e:
             continue_next = False
             message = "Unknown"
