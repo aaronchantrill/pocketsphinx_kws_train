@@ -23,6 +23,7 @@ except ImportError:
     pocketsphinx = None
     pocketsphinx_available = False
 from .g2p import PhonetisaurusG2P
+from .g2p import execute
 
 # The stt_trainer plugin provides a plugin that is used with the
 # NaomiSTTTrainer.py program to train a stt engine based on the
@@ -78,6 +79,7 @@ class Pocketsphinx_KWS_Train(plugin.STTTrainerPlugin):
             ['pocketsphinx', 'nbest'],
             3
         )
+        self.hmm_dir = profile.get(['pocketsphinx', 'hmm_dir'])
         self.fst_model = profile.get(['pocketsphinx', 'fst_model'])
         self.fst_model_alphabet = profile.get(
             ['pocketsphinx', 'fst_model_alphabet'],
@@ -114,36 +116,58 @@ class Pocketsphinx_KWS_Train(plugin.STTTrainerPlugin):
             conn = sqlite3.connect(self.audiolog_db)
             c = conn.cursor()
             if(command==""):
-                command="step1"
+                command="step-10"
+                response.append("<pre>-----------------------------------------------------------------------------------------------------</pre>")
+                response.append("<pre>|{:10s}|{:10s}|{:10s}|{:10s}|{:10s}|{:10s}|{:10s}|{:10s}|{:10s}|</pre>".format(
+                    "Keyword",
+                    "Theshold",
+                    "Detected",
+                    "TP",
+                    "FP",
+                    "FN",
+                    "Precision",
+                    "Recall",
+                    "F1"
+                ))
+                response.append("<pre>-----------------------------------------------------------------------------------------------------</pre>")
+                #table = []
+                #table.append("<table><tr><th>Keyword</th><th>Threshold</th><th>Instances</th><th>TP</th><th>FP</th><th>FN</th><th>Precision</th><th>Recall</th><th>F1</th></tr>")
             if(command[:4]=="step"):
                 step = eval(command[4:])
-                if(step<50):
+                if(step<10):
                     nextcommand="step{}".format(step+1)
                 else:
                     nextcommand="finish"
                 # compile the keywords into a dictionary
                 language = profile.get(['language'], 'en-US')
-
                 vocabulary = vocabcompiler.VocabularyCompiler(
                     self.info.name,
                     self._vocabulary_name,
                     path=paths.sub('vocabularies', language)
                 )
-
-                vocabulary.compile(
-                    vocabulary,
-                    self.keywords
-                )
-
                 # Get a list of all records to tested. This includes records of type
                 # active, passive, noise and unclear (noise and unclear are assumed not
                 # to contain the word "Naomi"
                 query = " ".join([
-                    "select distinct",
-                    " filename,",
-                    " transcription,",
-                    " verified_transcription",
-                    "from audiolog"
+                    "select *",
+                    "from(",
+                    "    select distinct ",
+                    "        filename,verified_transcription",
+                    "    from audiolog",
+                    "    where reviewed > ''",
+                    "        and verified_transcription like '%MAGICVOICE%'",
+                    "    limit 5",
+                    ")a",
+                    "union select * ",
+                    "from(",
+                    "    select distinct ",
+                    "        filename, verified_transcription",
+                    "    from audiolog",
+                    "    where reviewed > ''",
+                    "        and transcription like '%MAGICVOICE%'",
+                    "        and verified_transcription not like '%MAGICVOICE%'",
+                    "    limit 5)",
+                    "b;"
                 ])
                 c.execute(query)
                 test_data = c.fetchall()
@@ -155,25 +179,46 @@ class Pocketsphinx_KWS_Train(plugin.STTTrainerPlugin):
                 # in the verified transcription
                 threshold=step
                 for keyword in self.keywords:
+                    keyword=keyword.upper()
+                    # Get a list of all records to tested. This includes records of type
+                    # active, passive, noise and unclear (noise and unclear are assumed not
+                    # to contain the word "Naomi"
+                    query = " ".join([
+                        "select *",
+                        "from(",
+                        "    select distinct ",
+                        "        filename,verified_transcription",
+                        "    from audiolog",
+                        "    where reviewed > ''",
+                        "        and verified_transcription like '%",keyword,"%'",
+                        "    limit 5",
+                        ")a",
+                        "union select * ",
+                        "from(",
+                        "    select distinct ",
+                        "        filename, verified_transcription",
+                        "    from audiolog",
+                        "    where reviewed > ''",
+                        "        and transcription like '%",keyword,"%'",
+                        "        and verified_transcription not like '%",keyword,"%'",
+                        "    limit 5)",
+                        "b;"
+                    ])
+                    total_instances = 0
+                    total_detected = 0
                     false_positives = 0
                     false_negatives = 0
                     true_positives = 0
-                    total_instances = 0
-                    total_detected = 0
+                    precision = 0
+                    recall = 0
+                    f1 = 0
                     self._logger.debug(keyword)
-                    self._logger.debug(
-                        ("%s --model=%s --beam=1000 --thresh=99.0 --accumulate=true " +
-                        "--pmass=0.85 --nlog_probs=false --wordlist=%s --nbest=%d") %
-                        (self.executable, self.fst_model, tmp_fname, self.nbest)
-                    )
                     # create a dictionary for the keyword
-                    output = execute(
-                        self.executable,
-                        self.fst_model,
-                        tmp_fname,
-                        is_file=True,
-                        nbest=self.nbest
+                    vocabulary.compile(
+                        sphinxvocab.compile_vocabulary,
+                        [keyword]
                     )
+                    dict_path = sphinxvocab.get_dictionary_path(vocabulary.path)
                     # speech = AudioFile(
                     #     lm=False,
                     #     audio_file='/home/pi/.config/naomi/audiolog/2020-06-19_05-36-28k9zu8zyy.wav',
@@ -184,27 +229,36 @@ class Pocketsphinx_KWS_Train(plugin.STTTrainerPlugin):
                     # )
                     # Pocketsphinx v5
                     config = pocketsphinx.Decoder.default_config()
-                    config.set_string('-hmm', hmm_dir)
+                    config.set_string('-hmm', self.hmm_dir)
                     config.set_string('-keyphrase', keyword)
-                    config.set_float('-kws_threshold', eval("1e+{}".format(threshold)))
+                    if(threshold<0):
+                        config.set_float('-kws_threshold', eval("1e-{}".format(-threshold)))
+                    else:
+                        config.set_float('-kws_threshold', eval("1e+{}".format(threshold)))
                     config.set_string('-dict', dict_path)
-                    config.set_string('-logfn', self._logger)
-                    self._decoder = pocketsphinx.Decoder(config)
+                    decoder = pocketsphinx.Decoder(config)
                     # Now we have the decoder configured at the current level
                     # Run through the data
-                    for recording in test_data:
+                    max_samples = 10
+                    samples = len(test_data) if len(test_data)<max_samples else max_samples
+                    for index in range(samples):
+                        recording = test_data[index]
+                        print("{} {} {}/{}".format(keyword, threshold, index, samples))
+                        print(recording)
                         filename, transcript=recording
-                        transcript=upper(transcript)
+                        transcript=transcript.upper()
                         # Check how many times the keyphrase actually appears in the transcript
                         transcript_count = transcript.count(keyword)
                         decoder_count = 0
-                        with open(filename, "r+b") as fp:
+                        print(os.path.join(self.audiolog_dir, filename))
+                        with open(os.path.join(self.audiolog_dir, filename), "r+b") as fp:
                             fp.seek(44)
                             audio_data=fp.read()
                             decoder.start_utt()
-                            decoder.process_raw(fp)
+                            decoder.process_raw(audio_data, False, True)
                             decoder.end_utt()
                             for s in decoder.seg():
+                                print(dir(decoder))
                                 if(s.word==keyword):
                                     decoder_count+=1
                         # so if decoder_count < transcript_count, then we assume
@@ -225,16 +279,52 @@ class Pocketsphinx_KWS_Train(plugin.STTTrainerPlugin):
                         else:
                             false_positives += decoder_count - transcript_count
                             true_positives += transcript_count
-                print("Keyword: {}".format(keyword))
-                print("Threshold: {}".format(threshold))
-                print("Correct: {}".format(correct))
-                print("False positives: {}".format(false_positives))
-                print("False negatives: {}".format(false_negatives))
-                print("Precision: {}".format(true_positives/total_detected))
-                print("Recall: {}".format(true_positives/total_instances))
-                print()
+                        precision = 0
+                        if(true_positives + false_positives > 0):
+                            precision = true_positives/(true_positives+false_positives)
+                        recall = 0
+                        if(true_positives + false_negatives > 0):
+                            recall = true_positives/(true_positives+false_negatives)
+                        f1 = 0
+                        if(precision+recall > 0):
+                            f1 = 2*(precision*recall/(precision+recall))
+                        #print("Instances: {} TP: {} FP: {} FN: {} Precision: {} Recall: {} F1: {}".format(
+                        #    total_instances,
+                        #    true_positives,
+                        #    false_positives,
+                        #    false_negatives,
+                        #    precision,
+                        #    recall,
+                        #    f1
+                        #))
+                    response.append("<pre>|{:10s}|{:10d}|{:10s}|{:10d}|{:10d}|{:10d}|{:10.3f}|{:10.3f}|{:10.3f}|</pre>".format(
+                        keyword,
+                        threshold,
+                        str(total_detected)+"/"+str(total_instances),
+                        true_positives,
+                        false_positives,
+                        false_negatives,
+                        precision,
+                        recall,
+                        f1
+                    ))
+                    #table.append("<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+                    #    keyword,
+                    #    threshold,
+                    #    total_instances,
+                    #    true_positives,
+                    #    false_positives,
+                    #    false_negatives,
+                    #    precision,
+                    #    recall,
+                    #    f1
+                    #))
+            if(command=="finish"):
+                response.append("<pre>-----------------------------------------------------------------------------------------------------</pre>")
             else:
                 print("Command: {}".format(command))
+            print("\n".join(response))
+                
         except Exception as e:
             continue_next = False
             message = "Unknown"
