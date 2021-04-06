@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 import logging
 import os
-import sqlite3
+import re
 from naomi import paths
 from naomi import plugin
 from naomi import profile
 from naomi import vocabcompiler
-from . import sphinxvocab 
+from . import sphinxvocab
 try:
     try:
         from pocketsphinx import pocketsphinx
@@ -15,15 +15,11 @@ try:
         # See http://sourceforge.net/p/cmusphinx/bugs/284/ for details.
         from pocketsphinx import pocketsphinx
     pocketsphinx_available = True
-    # Why do we have to import sphinxbase.sphinxbase.*?
-    # otherwise, when we create pocketsphinx.Decoder.default_config()
-    # we get the wrong object for some reason.
-    from sphinxbase.sphinxbase import *
 except ImportError:
     pocketsphinx = None
     pocketsphinx_available = False
 from .g2p import PhonetisaurusG2P
-from .g2p import execute
+
 
 # The stt_trainer plugin provides a plugin that is used with the
 # NaomiSTTTrainer.py program to train a stt engine based on the
@@ -91,7 +87,7 @@ class Pocketsphinx_KWS_Train(plugin.STTTrainerPlugin):
             fst_model_alphabet=self.fst_model_alphabet,
             nbest=self.nbest
         )
-        self._vocabulary_name='pocketsphinx_kws'
+        self._vocabulary_name = 'pocketsphinx_kws'
 
         """
         Initiates the pocketsphinx instance.
@@ -104,19 +100,30 @@ class Pocketsphinx_KWS_Train(plugin.STTTrainerPlugin):
         if not pocketsphinx_available:
             raise ImportError("Pocketsphinx not installed!")
 
-
     # command allows the output to split into stages, and description allows
     # a description to be passed in with the incoming command.
     # If the nextcommand is the empty string, then the program concludes.
-    def HandleCommand(self, command, description):
+    def HandleCommand(self, **kwargs):
+        command = kwargs['command']
+        description = kwargs['description']
+        conn = kwargs['conn']
+        best = 0
         response = []
         nextcommand = ""
         continue_next = True
         try:
-            conn = sqlite3.connect(self.audiolog_db)
-            c = conn.cursor()
-            if(command==""):
-                command="step-10"
+            conn.execute(" ".join([
+                "create table if not exists pocketsphinx_kws_temp(",
+                "   keyword,",
+                "   threshold,",
+                "   precision,",
+                "   recall,",
+                "   f1",
+                ")"
+            ]))
+            conn.commit()
+            if(command == ""):
+                command = "step:-10:10:1:20:-10"
                 response.append("<pre>-----------------------------------------------------------------------------------------------------</pre>")
                 response.append("<pre>|{:10s}|{:10s}|{:10s}|{:10s}|{:10s}|{:10s}|{:10s}|{:10s}|{:10s}|</pre>".format(
                     "Keyword",
@@ -130,14 +137,20 @@ class Pocketsphinx_KWS_Train(plugin.STTTrainerPlugin):
                     "F1"
                 ))
                 response.append("<pre>-----------------------------------------------------------------------------------------------------</pre>")
-                #table = []
-                #table.append("<table><tr><th>Keyword</th><th>Threshold</th><th>Instances</th><th>TP</th><th>FP</th><th>FN</th><th>Precision</th><th>Recall</th><th>F1</th></tr>")
-            if(command[:4]=="step"):
-                step = eval(command[4:])
-                if(step<10):
-                    nextcommand="step{}".format(step+1)
+                conn.execute("delete from pocketsphinx_kws_temp")
+                conn.commit()
+            if(command[:4] == "step"):
+                # step:[start]:[end]:[stepsize]:[samples]:[step]
+                params = re.search(r"^step:([-\d]+):([-\d]+):([-\d]+):([-\d]+):([-\d]+)$", command)
+                start = int(params[1])
+                end = int(params[2])
+                stepsize = int(params[3])
+                samples = int(params[4])
+                step = int(params[5])
+                if(step < end):
+                    nextcommand = "step:{}:{}:{}:{}:{}".format(start, end, stepsize, samples, step + stepsize)
                 else:
-                    nextcommand="finish"
+                    nextcommand = "finish"
                 # compile the keywords into a dictionary
                 language = profile.get(['language'], 'en-US')
                 vocabulary = vocabcompiler.VocabularyCompiler(
@@ -145,41 +158,15 @@ class Pocketsphinx_KWS_Train(plugin.STTTrainerPlugin):
                     self._vocabulary_name,
                     path=paths.sub('vocabularies', language)
                 )
-                # Get a list of all records to tested. This includes records of type
-                # active, passive, noise and unclear (noise and unclear are assumed not
-                # to contain the word "Naomi"
-                query = " ".join([
-                    "select *",
-                    "from(",
-                    "    select distinct ",
-                    "        filename,verified_transcription",
-                    "    from audiolog",
-                    "    where reviewed > ''",
-                    "        and verified_transcription like '%MAGICVOICE%'",
-                    "    limit 5",
-                    ")a",
-                    "union select * ",
-                    "from(",
-                    "    select distinct ",
-                    "        filename, verified_transcription",
-                    "    from audiolog",
-                    "    where reviewed > ''",
-                    "        and transcription like '%MAGICVOICE%'",
-                    "        and verified_transcription not like '%MAGICVOICE%'",
-                    "    limit 5)",
-                    "b;"
-                ])
-                c.execute(query)
-                test_data = c.fetchall()
                 # The threshold should be between 1 and 50. Run with 1 first and
                 # get a matrix of true positives, false positives, true negatives
                 # and false negatives. If the audio contains the word "Naomi" then
                 # the word "Naomi" should appear in the verified transcription.
                 # If the type is unclear or noise, then there should not be anything
                 # in the verified transcription
-                threshold=step
+                threshold = step
                 for keyword in self.keywords:
-                    keyword=keyword.upper()
+                    keyword = keyword.upper()
                     # Get a list of all records to tested. This includes records of type
                     # active, passive, noise and unclear (noise and unclear are assumed not
                     # to contain the word "Naomi"
@@ -190,8 +177,8 @@ class Pocketsphinx_KWS_Train(plugin.STTTrainerPlugin):
                         "        filename,verified_transcription",
                         "    from audiolog",
                         "    where reviewed > ''",
-                        "        and verified_transcription like '%",keyword,"%'",
-                        "    limit 5",
+                        "        and verified_transcription like '%", keyword, "%'",
+                        "    limit {}".format(samples / 2),
                         ")a",
                         "union select * ",
                         "from(",
@@ -199,11 +186,15 @@ class Pocketsphinx_KWS_Train(plugin.STTTrainerPlugin):
                         "        filename, verified_transcription",
                         "    from audiolog",
                         "    where reviewed > ''",
-                        "        and transcription like '%",keyword,"%'",
-                        "        and verified_transcription not like '%",keyword,"%'",
-                        "    limit 5)",
+                        "        and transcription like '%", keyword, "%'",
+                        "        and verified_transcription not like '%", keyword, "%'",
+                        "    limit {})".format(samples / 2),
                         "b;"
                     ])
+                    print("Selecting examples")
+                    print(query)
+                    test_data = conn.execute(query).fetchall()
+                    print(test_data)
                     total_instances = 0
                     total_detected = 0
                     false_positives = 0
@@ -231,7 +222,7 @@ class Pocketsphinx_KWS_Train(plugin.STTTrainerPlugin):
                     config = pocketsphinx.Decoder.default_config()
                     config.set_string('-hmm', self.hmm_dir)
                     config.set_string('-keyphrase', keyword)
-                    if(threshold<0):
+                    if(threshold < 0):
                         config.set_float('-kws_threshold', eval("1e-{}".format(-threshold)))
                     else:
                         config.set_float('-kws_threshold', eval("1e+{}".format(threshold)))
@@ -239,28 +230,25 @@ class Pocketsphinx_KWS_Train(plugin.STTTrainerPlugin):
                     decoder = pocketsphinx.Decoder(config)
                     # Now we have the decoder configured at the current level
                     # Run through the data
-                    max_samples = 10
-                    samples = len(test_data) if len(test_data)<max_samples else max_samples
-                    for index in range(samples):
+                    for index in range(len(test_data)):
                         recording = test_data[index]
-                        print("{} {} {}/{}".format(keyword, threshold, index, samples))
+                        print("{} {} {}/{}".format(keyword, threshold, index, len(test_data)))
                         print(recording)
-                        filename, transcript=recording
-                        transcript=transcript.upper()
+                        filename, transcript = recording
+                        transcript = transcript.upper()
                         # Check how many times the keyphrase actually appears in the transcript
                         transcript_count = transcript.count(keyword)
                         decoder_count = 0
                         print(os.path.join(self.audiolog_dir, filename))
                         with open(os.path.join(self.audiolog_dir, filename), "r+b") as fp:
                             fp.seek(44)
-                            audio_data=fp.read()
+                            audio_data = fp.read()
                             decoder.start_utt()
                             decoder.process_raw(audio_data, False, True)
                             decoder.end_utt()
                             for s in decoder.seg():
-                                print(dir(decoder))
-                                if(s.word==keyword):
-                                    decoder_count+=1
+                                if(s.word == keyword):
+                                    decoder_count += 1
                         # so if decoder_count < transcript_count, then we assume
                         # transcript_count-decoder_count instances got missed
                         # (false negative)
@@ -273,6 +261,14 @@ class Pocketsphinx_KWS_Train(plugin.STTTrainerPlugin):
                         # wrong place, but we'll assume not.
                         total_instances += transcript_count
                         total_detected += decoder_count
+                        print(
+                            "{}: {}/{} ({})".format(
+                                transcript,
+                                decoder_count,
+                                transcript_count,
+                                total_instances
+                            )
+                        )
                         if decoder_count < transcript_count:
                             false_negatives += transcript_count - decoder_count
                             true_positives += decoder_count
@@ -288,7 +284,7 @@ class Pocketsphinx_KWS_Train(plugin.STTTrainerPlugin):
                         f1 = 0
                         if(precision+recall > 0):
                             f1 = 2*(precision*recall/(precision+recall))
-                        #print("Instances: {} TP: {} FP: {} FN: {} Precision: {} Recall: {} F1: {}".format(
+                        # print("Instances: {} TP: {} FP: {} FN: {} Precision: {} Recall: {} F1: {}".format(
                         #    total_instances,
                         #    true_positives,
                         #    false_positives,
@@ -296,7 +292,13 @@ class Pocketsphinx_KWS_Train(plugin.STTTrainerPlugin):
                         #    precision,
                         #    recall,
                         #    f1
-                        #))
+                        # ))
+                    conn.execute(
+                        "insert into pocketsphinx_kws_temp(keyword, threshold, precision, recall, f1)values(?, ?, ?, ?, ?)", (
+                            keyword, threshold, precision, recall, f1
+                        )
+                    )
+                    conn.commit()
                     response.append("<pre>|{:10s}|{:10d}|{:10s}|{:10d}|{:10d}|{:10d}|{:10.3f}|{:10.3f}|{:10.3f}|</pre>".format(
                         keyword,
                         threshold,
@@ -308,23 +310,92 @@ class Pocketsphinx_KWS_Train(plugin.STTTrainerPlugin):
                         recall,
                         f1
                     ))
-                    #table.append("<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
-                    #    keyword,
-                    #    threshold,
-                    #    total_instances,
-                    #    true_positives,
-                    #    false_positives,
-                    #    false_negatives,
-                    #    precision,
-                    #    recall,
-                    #    f1
-                    #))
-            if(command=="finish"):
+                    maxf1 = conn.execute("select max(f1) from pocketsphinx_kws_temp").fetchone()[0]
+                    print("Max(f1) = {}".format(maxf1))
+                    if(maxf1 > f1):
+                        countmax = conn.execute(
+                            " ".join([
+                                "select count(*)",
+                                "from pocketsphinx_kws_temp",
+                                "where f1 = {}".format(maxf1)
+                            ])
+                        ).fetchone()[0]
+                        start = conn.execute(
+                            " ".join([
+                                "select case",
+                                "   when exists(",
+                                "       select 1",
+                                "       from pocketsphinx_kws_temp",
+                                "       where threshold < (",
+                                "           select min(threshold)",
+                                "           from pocketsphinx_kws_temp",
+                                "           where f1=(",
+                                "               select max(f1)",
+                                "               from pocketsphinx_kws_temp",
+                                "           )",
+                                "       )",
+                                "   ) then (",
+                                "       select max(threshold)",
+                                "       from pocketsphinx_kws_temp",
+                                "       where threshold < (",
+                                "           select min(threshold)",
+                                "           from pocketsphinx_kws_temp",
+                                "           where f1=(",
+                                "               select max(f1)",
+                                "               from pocketsphinx_kws_temp",
+                                "           )",
+                                "       )",
+                                "   ) else (",
+                                "       select min(threshold)",
+                                "       from pocketsphinx_kws_temp",
+                                "   )",
+                                "end"
+                            ])
+                        ).fetchone()[0]
+                        end = threshold
+                        if(countmax == 1):
+                            # We have identified our best match
+                            best = start
+                            command = "finish"
+                        else:
+                            # if the number is starting to fall, then we have
+                            # passed the peak and there is no point continuing
+                            if(samples < 100):
+                                # clear the database
+                                conn.execute("delete from pocketsphinx_kws_temp")
+                                conn.commit()
+                                # Test the best range again by increasing the
+                                # number of samples
+                                samples = samples * 2
+                                nextcommand = "step:{}:{}:{}:{}:{}".format(
+                                    start,
+                                    end,
+                                    stepsize,
+                                    samples,
+                                    start
+                                )
+                            else:
+                                continue_next = False
+                                command = "finish"
+                                best = conn.execute(
+                                    " ".join([
+                                        "select min(threshold)",
+                                        "from pocketsphinx_kws_temp",
+                                        "where f1=(",
+                                        "   select max(f1)",
+                                        "   from pocketsphinx_kws_temp",
+                                        ")"
+                                    ])
+                                ).fetchone()[0]
+            if(command == "finish"):
                 response.append("<pre>-----------------------------------------------------------------------------------------------------</pre>")
+                response.append("Best threshold: {}".format(best))
+                profile.set_profile_var(['pocketsphinx_kws', 'threshold'], best)
+                profile.save_profile()
+                continue_next = False
             else:
                 print("Command: {}".format(command))
             print("\n".join(response))
-                
         except Exception as e:
             continue_next = False
             message = "Unknown"
@@ -336,9 +407,11 @@ class Pocketsphinx_KWS_Train(plugin.STTTrainerPlugin):
                 ),
                 exc_info=True
             )
-            response.append('<span class="failure">{}</span>'.format(
-                message
-            ))
+            response.append(
+                '<span class="failure">{}</span>'.format(
+                    message
+                )
+            )
         if not continue_next:
             nextcommand = ""
         return response, nextcommand, description
